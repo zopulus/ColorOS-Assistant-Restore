@@ -47,7 +47,8 @@ public final class AssistRestoreModule extends XposedModule {
     @Override
     public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
         String packageName = param.getPackageName();
-        if (GOOGLE_APP_PACKAGE.equals(packageName) && GOOGLE_APP_PACKAGE.equals(processName)) {
+        if (GOOGLE_APP_PACKAGE.equals(packageName)
+                && isPackageProcess(GOOGLE_APP_PACKAGE, processName)) {
             if (googleAppInstalled) {
                 return;
             }
@@ -83,6 +84,11 @@ public final class AssistRestoreModule extends XposedModule {
         } catch (Throwable t) {
             logError("systemui_install_failed", t);
         }
+    }
+
+    /** Google 功能入口运行在多个命名进程中，身份 Hook 需覆盖整个包；其他包仍精确匹配进程。 */
+    private static boolean isPackageProcess(String packageName, String process) {
+        return packageName.equals(process) || process.startsWith(packageName + ":");
     }
 
     @Override

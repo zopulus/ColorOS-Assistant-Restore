@@ -33,6 +33,8 @@ final class CtsHooks {
     private static final String CTS_SERVICE =
             "com.android.server.contextualsearch.ContextualSearchManagerService";
     private static final String SYSTEM_SERVER = "com.android.server.SystemServer";
+    private static final String CTS_CONFIG =
+            "android.app.contextualsearch.ContextualSearchConfig";
 
     static final String PKG_GOOGLE = "com.google.android.googlequicksearchbox";
     private static final String PKG_SYSTEMUI = "com.android.systemui";
@@ -47,6 +49,7 @@ final class CtsHooks {
         int packageNameResId = resolvePackageNameResId(module, classLoader);
         installDeviceHasConfigString(module, classLoader, packageNameResId);
         installContextualSearchPackageName(module, classLoader);
+        installContextualSearchAvailability(module, classLoader);
         installPermissionBypass(module, classLoader);
         installStartContextualSearch(module, classLoader);
     }
@@ -112,6 +115,34 @@ final class CtsHooks {
         }
     }
 
+    /** SystemUI 可能缓存可用性结果，这里仅覆盖 system/SystemUI 调用方。 */
+    private static void installContextualSearchAvailability(
+            AssistRestoreModule module, ClassLoader classLoader) {
+        try {
+            Class<?> service = Class.forName(CTS_SERVICE, true, classLoader);
+            Method method = method(service, "isContextualSearchAvailable");
+            if (method == null) {
+                module.logInfo("hook_skipped target=" + CTS_SERVICE
+                        + ".isContextualSearchAvailable reason=not_found");
+                return;
+            }
+            module.hook(method)
+                    .setId("cts_is_available")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        if (isTrustedCaller(module)) {
+                            return Boolean.TRUE;
+                        }
+                        return chain.proceed();
+                    });
+            module.logInfo("hook_installed target=" + CTS_SERVICE
+                    + ".isContextualSearchAvailable");
+        } catch (Throwable t) {
+            module.logError("hook_failed target=" + CTS_SERVICE
+                    + ".isContextualSearchAvailable", t);
+        }
+    }
+
     private static void installPermissionBypass(
             AssistRestoreModule module, ClassLoader classLoader) {
         try {
@@ -171,10 +202,18 @@ final class CtsHooks {
                 continue;
             }
             Class<?>[] parameterTypes = candidate.getParameterTypes();
-            if (parameterTypes.length != 1 || parameterTypes[0] != int.class) {
+            boolean legacy = parameterTypes.length == 1 && parameterTypes[0] == int.class;
+            boolean modern = parameterTypes.length == 2
+                    && parameterTypes[0] == int.class
+                    && isContextualSearchConfig(parameterTypes[1]);
+            if (!legacy && !modern) {
                 continue;
             }
-            candidate.setAccessible(true);
+            try {
+                candidate.setAccessible(true);
+            } catch (Throwable ignored) {
+                // 公开的 Binder 方法无需提升可访问性。
+            }
             try {
                 module.hook(candidate)
                         .setId("cts_start_contextual_search")
@@ -186,7 +225,8 @@ final class CtsHooks {
                             long token = Binder.clearCallingIdentity();
                             try {
                                 module.logInfo("cts_start_contextual_search entrypoint="
-                                        + chain.getArg(0));
+                                        + chain.getArg(0)
+                                        + (modern ? " config=" + chain.getArg(1) : ""));
                                 return chain.proceed();
                             } finally {
                                 Binder.restoreCallingIdentity(token);
@@ -199,6 +239,11 @@ final class CtsHooks {
             }
         }
         return count;
+    }
+
+    private static boolean isContextualSearchConfig(Class<?> type) {
+        return type != null && (CTS_CONFIG.equals(type.getName())
+                || "ContextualSearchConfig".equals(type.getSimpleName()));
     }
 
     /**

@@ -29,6 +29,9 @@ import java.lang.reflect.Method;
 final class LauncherHooks {
     private static final String QUICK_STEP_CONTRACT =
             "com.android.systemui.shared.system.QuickStepContract";
+    /** ColorOS 17 的 OplusLauncher 在混淆辅助类中保留相同契约。 */
+    private static final String QUICK_STEP_CONTRACT_OPLUS = "ab.n";
+    private static final String QUICK_STEP_CONTRACT_OPLUS_METHOD = "c";
 
     private static final long STATE_SCREEN_PINNING = 1L;
     private static final long STATE_NAV_BAR_HIDDEN = 2L;
@@ -53,11 +56,46 @@ final class LauncherHooks {
     }
 
     static void install(AssistRestoreModule module, ClassLoader classLoader) {
+        Method isAssistantGestureDisabled = null;
+        String target = QUICK_STEP_CONTRACT + ".isAssistantGestureDisabled";
         try {
             Class<?> contract = Class.forName(QUICK_STEP_CONTRACT, true, classLoader);
-            Method isAssistantGestureDisabled =
-                    contract.getMethod("isAssistantGestureDisabled", long.class);
+            isAssistantGestureDisabled = Refl.method(
+                    contract, "isAssistantGestureDisabled", long.class);
+        } catch (Throwable t) {
+            module.logWarn("quick_step_contract_unavailable class=" + QUICK_STEP_CONTRACT
+                    + " reason=" + t.getClass().getSimpleName());
+        }
+        if (isAssistantGestureDisabled == null) {
+            try {
+                Class<?> contract = Class.forName(
+                        QUICK_STEP_CONTRACT_OPLUS, true, classLoader);
+                isAssistantGestureDisabled = Refl.method(
+                        contract, QUICK_STEP_CONTRACT_OPLUS_METHOD, long.class);
+                target = QUICK_STEP_CONTRACT_OPLUS + "."
+                        + QUICK_STEP_CONTRACT_OPLUS_METHOD;
+                if (isAssistantGestureDisabled != null) {
+                    module.logInfo("quick_step_contract_fallback class="
+                            + QUICK_STEP_CONTRACT_OPLUS + " method="
+                            + QUICK_STEP_CONTRACT_OPLUS_METHOD);
+                }
+            } catch (Throwable t) {
+                module.logWarn("quick_step_contract_fallback_unavailable class="
+                        + QUICK_STEP_CONTRACT_OPLUS + " reason="
+                        + t.getClass().getSimpleName());
+            }
+        }
+        if (isAssistantGestureDisabled == null) {
+            module.logError("hook_skipped target=" + QUICK_STEP_CONTRACT
+                    + ".isAssistantGestureDisabled reason=not_found");
+            return;
+        }
+        installGestureDisabledHook(module, isAssistantGestureDisabled, target);
+    }
 
+    private static void installGestureDisabledHook(
+            AssistRestoreModule module, Method isAssistantGestureDisabled, String target) {
+        try {
             module.hook(isAssistantGestureDisabled)
                     .setId("assistant_gesture_disabled")
                     .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
@@ -96,11 +134,9 @@ final class LauncherHooks {
                                 + " flags=0x" + Long.toHexString(flags));
                         return Boolean.FALSE;
                     });
-            module.logInfo("hook_installed target=" + QUICK_STEP_CONTRACT
-                    + ".isAssistantGestureDisabled");
+            module.logInfo("hook_installed target=" + target);
         } catch (Throwable t) {
-            module.logError("hook_failed target=" + QUICK_STEP_CONTRACT
-                    + ".isAssistantGestureDisabled", t);
+            module.logError("hook_failed target=" + target, t);
         }
     }
 }

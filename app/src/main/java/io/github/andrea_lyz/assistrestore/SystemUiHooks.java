@@ -16,6 +16,7 @@ import android.view.ViewParent;
 import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.view.WindowMetrics;
+import android.view.MotionEvent;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
@@ -136,12 +137,14 @@ final class SystemUiHooks {
     }
 
     static void install(AssistRestoreModule module, ClassLoader classLoader) {
+        ensureVoiceInteractionService(module, TargetIntents.appContext());
         AssistPipeline pipeline = resolveAssistPipeline(module, classLoader);
         CtsPipeline cts = resolveCtsPipeline(module, classLoader);
         installAssistDispatch(module, classLoader, pipeline, cts);
         installAssistantAvailability(module, classLoader);
         installGestureHandleLongPress(module, classLoader, pipeline, cts);
         installOcrScreenHandleLongPress(module, classLoader, pipeline, cts);
+        installHandlePressAvailability(module, classLoader);
         installHiddenGestureBarHandleTouch(module, classLoader);
         installHandleTouchRegion(module, classLoader);
     }
@@ -156,11 +159,16 @@ final class SystemUiHooks {
         private final Method getService;
         private final Method asInterface;
         private final Method startContextualSearch;
+        private final boolean acceptsConfig;
+        private final Object defaultConfig;
 
-        private CtsPipeline(Method getService, Method asInterface, Method startContextualSearch) {
+        private CtsPipeline(Method getService, Method asInterface, Method startContextualSearch,
+                boolean acceptsConfig, Object defaultConfig) {
             this.getService = getService;
             this.asInterface = asInterface;
             this.startContextualSearch = startContextualSearch;
+            this.acceptsConfig = acceptsConfig;
+            this.defaultConfig = defaultConfig;
         }
 
         /** @return {@code true} when the service accepted the request */
@@ -173,7 +181,13 @@ final class SystemUiHooks {
             if (service == null) {
                 return false;
             }
-            startContextualSearch.invoke(service, CtsHooks.CONTEXTUAL_SEARCH_ENTRYPOINT);
+            if (acceptsConfig) {
+                // Android 17 新增可空 config 参数；优先传入 DEFAULT_CONFIG，缺失时传 null。
+                startContextualSearch.invoke(service,
+                        CtsHooks.CONTEXTUAL_SEARCH_ENTRYPOINT, defaultConfig);
+            } else {
+                startContextualSearch.invoke(service, CtsHooks.CONTEXTUAL_SEARCH_ENTRYPOINT);
+            }
             return true;
         }
     }
@@ -186,10 +200,68 @@ final class SystemUiHooks {
             Class<?> iface = Class.forName(CTS_INTERFACE, false, classLoader);
             Class<?> stub = Class.forName(CTS_INTERFACE + "$Stub", false, classLoader);
             Method asInterface = stub.getMethod("asInterface", IBinder.class);
-            Method startContextualSearch = iface.getMethod("startContextualSearch", int.class);
-            return new CtsPipeline(getService, asInterface, startContextualSearch);
+            Method startContextualSearch = null;
+            boolean acceptsConfig = false;
+            Class<?> configClass = null;
+            for (Method candidate : iface.getMethods()) {
+                if (!"startContextualSearch".equals(candidate.getName())) {
+                    continue;
+                }
+                Class<?>[] parameterTypes = candidate.getParameterTypes();
+                if (parameterTypes.length == 2 && parameterTypes[0] == int.class
+                        && isContextualSearchConfig(parameterTypes[1])) {
+                    startContextualSearch = candidate;
+                    acceptsConfig = true;
+                    configClass = parameterTypes[1];
+                    break;
+                }
+                if (parameterTypes.length == 1 && parameterTypes[0] == int.class) {
+                    startContextualSearch = candidate;
+                }
+            }
+            if (startContextualSearch == null) {
+                throw new NoSuchMethodException("startContextualSearch");
+            }
+            Object defaultConfig = acceptsConfig
+                    ? resolveDefaultContextualSearchConfig(configClass) : null;
+            return new CtsPipeline(getService, asInterface, startContextualSearch,
+                    acceptsConfig, defaultConfig);
         } catch (Throwable t) {
             module.logError("circle_to_search_pipeline_failed", t);
+            return null;
+        }
+    }
+
+    private static boolean isContextualSearchConfig(Class<?> type) {
+        return type != null && ("android.app.contextualsearch.ContextualSearchConfig".equals(
+                type.getName()) || "ContextualSearchConfig".equals(type.getSimpleName()));
+    }
+
+    private static Object resolveDefaultContextualSearchConfig(Class<?> configClass) {
+        if (configClass == null) {
+            return null;
+        }
+        try {
+            Field field = Refl.field(configClass, "DEFAULT_CONFIG");
+            if (field != null) {
+                Object value = field.get(null);
+                if (value != null) {
+                    return value;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 回退到 Android 17 的公开 Builder。
+        }
+        try {
+            Class<?> builderClass = Class.forName(configClass.getName() + "$Builder", true,
+                    configClass.getClassLoader());
+            Constructor<?> constructor = builderClass.getDeclaredConstructor();
+            constructor.setAccessible(true);
+            Object builder = constructor.newInstance();
+            Method build = Refl.method(builderClass, "build");
+            return build == null ? null : build.invoke(builder);
+        } catch (Throwable ignored) {
+            // 允许传入 null；旧版/Oplus 可能没有默认配置或 Builder。
             return null;
         }
     }
@@ -207,12 +279,16 @@ final class SystemUiHooks {
         private final Method getAssistInfo;
         private final Method getVoiceInteractorComponentName;
         private final Method startAssistInternal;
+        private final boolean contextFirst;
+        private final Field contextField;
 
         private AssistPipeline(Method getAssistInfo, Method getVoiceInteractorComponentName,
-                Method startAssistInternal) {
+                Method startAssistInternal, boolean contextFirst, Field contextField) {
             this.getAssistInfo = getAssistInfo;
             this.getVoiceInteractorComponentName = getVoiceInteractorComponentName;
             this.startAssistInternal = startAssistInternal;
+            this.contextFirst = contextFirst;
+            this.contextField = contextField;
         }
 
         /** @return the component the request was sent to, or {@code null} when none is configured */
@@ -223,13 +299,27 @@ final class SystemUiHooks {
                 module.logWarn("assist_dispatch_skipped reason=no_assistant_configured");
                 return null;
             }
-            boolean isService =
-                    assistInfo.equals(getVoiceInteractorComponentName.invoke(assistManager));
+            if (!(assistInfo instanceof ComponentName)) {
+                module.logWarn("assist_dispatch_skipped reason=unexpected_assistant_type type="
+                        + assistInfo.getClass().getName());
+                return null;
+            }
+            ComponentName assistComponent = (ComponentName) assistInfo;
+            Context context = contextFor(assistManager);
+            ensureVoiceInteractionService(module, context);
+            Object voiceInteractor = getVoiceInteractorComponentName.invoke(assistManager);
+            boolean isService = assistInfo.equals(voiceInteractor);
+            if (!isService) {
+                // ColorOS 17 可能未同步 voice_interaction_service，这里按声明检查已选组件。
+                isService = isVoiceInteractionService(context, assistComponent);
+            }
             module.logInfo("assist_dispatch component=" + assistInfo
                     + " isService=" + isService
+                    + " voiceInteractor=" + voiceInteractor
+                    + " context=" + (context != null)
                     + " invocationType=" + args.getInt(EXTRA_INVOCATION_TYPE, 0));
-            startAssistInternal.invoke(assistManager, args, assistInfo, isService);
-            return assistInfo;
+            invokeStartAssistInternal(assistManager, args, assistComponent, isService);
+            return assistComponent;
         }
 
         /**
@@ -243,8 +333,42 @@ final class SystemUiHooks {
                     + " isService=" + isService
                     + " invocationType=" + args.getInt(EXTRA_INVOCATION_TYPE, 0)
                     + " pinned=true");
-            startAssistInternal.invoke(assistManager, args, component, isService);
+            invokeStartAssistInternal(assistManager, args, component, isService);
             return component;
+        }
+
+        private void invokeStartAssistInternal(Object assistManager, Bundle args,
+                ComponentName component, boolean isService) throws Throwable {
+            if (!contextFirst) {
+                startAssistInternal.invoke(assistManager, args, component, isService);
+                return;
+            }
+            Context context = TargetIntents.appContext();
+            if (context == null && contextField != null) {
+                Object value = contextField.get(assistManager);
+                if (value instanceof Context) {
+                    context = (Context) value;
+                }
+            }
+            if (context == null) {
+                throw new IllegalStateException("SystemUI context unavailable");
+            }
+            startAssistInternal.invoke(assistManager, context, args, component, isService);
+        }
+
+        private Context contextFor(Object assistManager) {
+            Context context = TargetIntents.appContext();
+            if (context == null && contextField != null) {
+                try {
+                    Object value = contextField.get(assistManager);
+                    if (value instanceof Context) {
+                        context = (Context) value;
+                    }
+                } catch (Throwable ignored) {
+                    // 直接使用应用 Context。
+                }
+            }
+            return context;
         }
     }
 
@@ -252,11 +376,28 @@ final class SystemUiHooks {
             AssistRestoreModule module, ClassLoader classLoader) {
         try {
             Class<?> assistManager = Class.forName(ASSIST_MANAGER, true, classLoader);
-            return new AssistPipeline(
-                    assistManager.getMethod("getAssistInfo"),
-                    assistManager.getMethod("getVoiceInteractorComponentName"),
-                    assistManager.getMethod("startAssistInternal",
-                            Bundle.class, ComponentName.class, boolean.class));
+            Method getAssistInfo = Refl.method(assistManager, "getAssistInfo");
+            Method getVoiceInteractorComponentName = Refl.method(
+                    assistManager, "getVoiceInteractorComponentName");
+            if (getAssistInfo == null || getVoiceInteractorComponentName == null) {
+                throw new NoSuchMethodException("assist info accessors");
+            }
+            Method startAssistInternal = Refl.method(assistManager, "startAssistInternal",
+                    Context.class, Bundle.class, ComponentName.class, boolean.class);
+            boolean contextFirst = startAssistInternal != null;
+            if (startAssistInternal == null) {
+                startAssistInternal = Refl.method(assistManager, "startAssistInternal",
+                        Bundle.class, ComponentName.class, boolean.class);
+            }
+            if (startAssistInternal == null) {
+                throw new NoSuchMethodException("startAssistInternal");
+            }
+            Field contextField = Refl.field(assistManager, "mContext");
+            if (contextField == null) {
+                contextField = Refl.field(assistManager, "context");
+            }
+            return new AssistPipeline(getAssistInfo, getVoiceInteractorComponentName,
+                    startAssistInternal, contextFirst, contextField);
         } catch (Throwable t) {
             module.logError("assist_pipeline_resolve_failed", t);
             return null;
@@ -277,9 +418,21 @@ final class SystemUiHooks {
         }
         try {
             Class<?> assistManager = Class.forName(ASSIST_MANAGER, true, classLoader);
-            Method startAssist = assistManager.getMethod("startAssist", Bundle.class);
-            Field overrideInvocationTypes = assistManager.getField("mAssistOverrideInvocationTypes");
-            Field activityManager = assistManager.getField("mActivityManager");
+            Method startAssist = Refl.method(assistManager, "startAssist", Bundle.class);
+            String startAssistTarget = ASSIST_MANAGER + ".startAssist";
+            if (startAssist == null) {
+                // ColorOS 17 的回调方法名为 startAssist$1；ColorOS 16 的 startAssist 已不存在。
+                startAssist = Refl.method(assistManager, "startAssist$1", Bundle.class);
+                startAssistTarget = ASSIST_MANAGER + ".startAssist$1";
+            }
+            if (startAssist == null) {
+                module.logError("hook_skipped target=" + ASSIST_MANAGER
+                        + ".startAssist reason=not_found");
+                return;
+            }
+            Field overrideInvocationTypes = Refl.field(
+                    assistManager, "mAssistOverrideInvocationTypes");
+            Field activityManager = Refl.field(assistManager, "mActivityManager");
             Method isExpRegion = Refl.staticMethod(classLoader, FEATURE_OPTION, "isExpRegion");
             if (isExpRegion == null) {
                 module.logWarn("region_gate_unresolved target=" + FEATURE_OPTION
@@ -303,11 +456,12 @@ final class SystemUiHooks {
                             module.logInfo("assist_skip reason=exp_region_active");
                             return result;
                         }
-                        if (isLockTaskMode(activityManager.get(manager))) {
+                        if (isLockTaskMode(fieldValue(activityManager, manager))) {
                             module.logInfo("assist_skip reason=lock_task_mode");
                             return result;
                         }
-                        if (isHandledByLauncherOverride(overrideInvocationTypes.get(manager), bundle)) {
+                        if (isHandledByLauncherOverride(
+                                fieldValue(overrideInvocationTypes, manager), bundle)) {
                             module.logInfo("assist_skip reason=launcher_override invocationType="
                                     + (bundle != null ? bundle.getInt(EXTRA_INVOCATION_TYPE, 0) : 0));
                             return result;
@@ -333,9 +487,20 @@ final class SystemUiHooks {
                         pipeline.dispatch(module, manager, bundle != null ? bundle : new Bundle());
                         return result;
                     });
-            module.logInfo("hook_installed target=" + ASSIST_MANAGER + ".startAssist");
+            module.logInfo("hook_installed target=" + startAssistTarget);
         } catch (Throwable t) {
             module.logError("hook_failed target=" + ASSIST_MANAGER + ".startAssist", t);
+        }
+    }
+
+    private static Object fieldValue(Field field, Object receiver) {
+        if (field == null || receiver == null) {
+            return null;
+        }
+        try {
+            return field.get(receiver);
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -348,6 +513,77 @@ final class SystemUiHooks {
             return value instanceof Boolean && (Boolean) value;
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /** 所选组件声明平台 VoiceInteractionService 时返回 true。 */
+    private static boolean isVoiceInteractionService(Context context, ComponentName component) {
+        if (context == null || component == null) {
+            return false;
+        }
+        try {
+            Intent probe = new Intent("android.service.voice.VoiceInteractionService")
+                    .setPackage(component.getPackageName());
+            List<ResolveInfo> matches = context.getPackageManager().queryIntentServices(probe, 0);
+            if (matches == null) {
+                return false;
+            }
+            for (ResolveInfo match : matches) {
+                ServiceInfo serviceInfo = match.serviceInfo;
+                if (serviceInfo != null && component.getPackageName().equals(serviceInfo.packageName)
+                        && component.getClassName().equals(serviceInfo.name)) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+            // 无法检查包信息时保留原始判断。
+        }
+        return false;
+    }
+
+    /** assistant 已选择但 voice_interaction_service 为空时，仅补齐缺失关联。 */
+    private static void ensureVoiceInteractionService(
+            AssistRestoreModule module, Context context) {
+        if (context == null || !AssistConfig.isEnabled(HookPrefs.get())) {
+            return;
+        }
+        try {
+            ContentResolver resolver = context.getContentResolver();
+            String current = Settings.Secure.getString(resolver, "voice_interaction_service");
+            if (current != null && !current.isEmpty()) {
+                return;
+            }
+            String assistantSetting = Settings.Secure.getString(resolver, SETTING_ASSISTANT);
+            ComponentName assistant = assistantSetting == null
+                    ? null : ComponentName.unflattenFromString(assistantSetting);
+            if (assistant == null) {
+                return;
+            }
+            ComponentName voiceService = resolveVoiceInteractionComponent(
+                    context, assistant.getPackageName());
+            if (voiceService == null) {
+                return;
+            }
+            String flattened = voiceService.flattenToString();
+            boolean written = false;
+            try {
+                Method putStringForUser = Settings.Secure.class.getMethod(
+                        "putStringForUser", ContentResolver.class, String.class,
+                        String.class, int.class);
+                Object result = putStringForUser.invoke(null, resolver,
+                        "voice_interaction_service", flattened, -2);
+                written = !Boolean.FALSE.equals(result);
+            } catch (Throwable ignored) {
+                written = Settings.Secure.putString(
+                        resolver, "voice_interaction_service", flattened);
+            }
+            if (written) {
+                module.logInfo("voice_interaction_service_repaired component=" + flattened);
+            } else {
+                module.logWarn("voice_interaction_service_repair_failed component=" + flattened);
+            }
+        } catch (Throwable t) {
+            module.logWarn("voice_interaction_service_repair_failed " + t);
         }
     }
 
@@ -643,7 +879,133 @@ final class SystemUiHooks {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // 5. NavBarUtils.isSideGestureBarHide
+    // 5. OplusNavigationHandle.shouldHandlePress
+    // ---------------------------------------------------------------------------------------------
+
+    /** 修复隐藏手势条启动时 OCR/CUI 观察器未初始化导致的按压判定失败。 */
+    private static void installHandlePressAvailability(
+            AssistRestoreModule module, ClassLoader classLoader) {
+        try {
+            Class<?> handle = Class.forName(SIDE_GESTURE_HANDLE, true, classLoader);
+            Method handleValidTouchEvent = handle.getMethod(
+                    "handleValidTouchEvent", MotionEvent.class);
+            module.hook(handleValidTouchEvent)
+                    .setId("handle_press_range_bootstrap")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object handleObject = chain.getThisObject();
+                        MotionEvent event = (MotionEvent) chain.getArg(0);
+                        repairHiddenHandleGestureRange(module, handleObject, event, true);
+                        Object result = chain.proceed();
+                        repairHiddenHandleGestureRange(module, handleObject, event, false);
+                        return result;
+                    });
+            module.logInfo("hook_installed target=" + SIDE_GESTURE_HANDLE
+                    + ".handleValidTouchEvent");
+
+            Method shouldHandlePress = handle.getMethod("shouldHandlePress");
+            module.hook(shouldHandlePress)
+                    .setId("handle_press_availability")
+                    .setExceptionMode(XposedInterface.ExceptionMode.PROTECTIVE)
+                    .intercept(chain -> {
+                        Object result = chain.proceed();
+                        if (Boolean.TRUE.equals(result)
+                                || !handleOwnedByModule()
+                                || !isHandleInGestureRange(chain.getThisObject())) {
+                            return result;
+                        }
+                        Object handleObject = chain.getThisObject();
+                        if (isKeyguardShowing(handleObject)) {
+                            return result;
+                        }
+                        Context context = handleObject instanceof View
+                                ? ((View) handleObject).getContext() : null;
+                        if (context != null && isHandleWakeSwitchOff(module, context)) {
+                            return result;
+                        }
+                        module.logInfo("handle_press_availability_repaired");
+                        return Boolean.TRUE;
+                    });
+            module.logInfo("hook_installed target=" + SIDE_GESTURE_HANDLE
+                    + ".shouldHandlePress");
+        } catch (Throwable t) {
+            module.logWarn("hook_skipped target=" + SIDE_GESTURE_HANDLE
+                    + ".shouldHandlePress " + t);
+        }
+    }
+
+    /** 隐藏手势条尚未完成布局时，提前修复首个事件的水平范围。 */
+    private static void repairHiddenHandleGestureRange(
+            AssistRestoreModule module, Object handleObject, MotionEvent event, boolean before) {
+        if (!(handleObject instanceof View)
+                || event == null
+                || event.getActionMasked() != MotionEvent.ACTION_DOWN
+                || !handleOwnedByModule()) {
+            return;
+        }
+        View handle = (View) handleObject;
+        if (handle.getWidth() > 0) {
+            // 正常布局后的手势条交给 OEM 处理；这里只修复启动时隐藏的情况。
+            return;
+        }
+        int barWidth = gestureBarWidthForCurrentRotation(handle);
+        int screenWidth = handle.getRootView() == null ? 0 : handle.getRootView().getWidth();
+        if (screenWidth <= 0) {
+            screenWidth = handle.getResources().getDisplayMetrics().widthPixels;
+        }
+        if (barWidth <= 0 || screenWidth <= 0) {
+            return;
+        }
+        int left = Math.max(0, (screenWidth - barWidth) / 2);
+        int right = left + barWidth;
+        boolean inRange = event.getX() >= left && event.getX() <= right;
+        try {
+            Field rangeField = Refl.field(handle.getClass(), "inGestureXRange");
+            if (rangeField != null) {
+                rangeField.setBoolean(handle, inRange);
+                if (before && inRange) {
+                    module.logInfo("handle_press_range_bootstrapped left=" + left
+                            + " right=" + right);
+                }
+            }
+        } catch (Throwable t) {
+            module.logWarn("handle_press_range_bootstrap_failed " + t);
+        }
+    }
+
+    private static int gestureBarWidthForCurrentRotation(View view) {
+        try {
+            int rotation = view.getDisplay() == null ? 0 : view.getDisplay().getRotation();
+            String name = rotation == 1 || rotation == 3
+                    ? "navigation_gesture_view_landscape_width"
+                    : "navigation_gesture_view_width";
+            int width = oplusDimension(view, name);
+            return width > 0 ? width : gestureBarWidth(view);
+        } catch (Throwable ignored) {
+            return gestureBarWidth(view);
+        }
+    }
+
+    private static boolean isHandleInGestureRange(Object handle) {
+        try {
+            Field field = Refl.field(handle.getClass(), "inGestureXRange");
+            return field != null && field.getBoolean(handle);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isKeyguardShowing(Object handle) {
+        try {
+            Field field = Refl.field(handle.getClass(), "isKeyguardShowing");
+            return field != null && field.getBoolean(handle);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // 6. NavBarUtils.isSideGestureBarHide
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -718,7 +1080,7 @@ final class SystemUiHooks {
     }
 
     // ---------------------------------------------------------------------------------------------
-    // 6. The gesture bar area belongs to the navigation-bar window
+    // 7. 手势条区域归导航栏窗口所有
     // ---------------------------------------------------------------------------------------------
 
     /**

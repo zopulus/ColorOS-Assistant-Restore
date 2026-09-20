@@ -1,6 +1,7 @@
 package io.github.andrea_lyz.assistrestore;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 
 /**
  * Makes the Google app believe it runs on a device Google ships Circle to Search for.
@@ -49,6 +50,26 @@ final class GoogleAppHooks {
             throws Throwable {
         Field field = owner.getDeclaredField(name);
         field.setAccessible(true);
-        field.set(null, value);
+        try {
+            field.set(null, value);
+            return;
+        } catch (IllegalAccessException finalField) {
+            // Android 17 禁止反射写入 Build 的 final 字段，改用 Unsafe 写入 ART 静态槽位。
+            Object unsafe = unsafe();
+            Method staticFieldBase = unsafe.getClass().getMethod("staticFieldBase", Field.class);
+            Method staticFieldOffset = unsafe.getClass().getMethod("staticFieldOffset", Field.class);
+            Method putObjectVolatile = unsafe.getClass().getMethod(
+                    "putObjectVolatile", Object.class, long.class, Object.class);
+            Object base = staticFieldBase.invoke(unsafe, field);
+            long offset = ((Number) staticFieldOffset.invoke(unsafe, field)).longValue();
+            putObjectVolatile.invoke(unsafe, base, offset, value);
+        }
+    }
+
+    private static Object unsafe() throws Throwable {
+        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+        Field singleton = unsafeClass.getDeclaredField("theUnsafe");
+        singleton.setAccessible(true);
+        return singleton.get(null);
     }
 }
